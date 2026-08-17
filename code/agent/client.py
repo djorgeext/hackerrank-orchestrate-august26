@@ -1,4 +1,10 @@
-"""Provider-neutral completion clients with explicit failure semantics (adapted for Ollama)."""
+"""Provider-neutral completion clients with explicit failure semantics.
+
+The public surface is intentionally structural: orchestration code only needs an
+object with ``complete``, ``supports_vision``, ``supports_audio``, and
+``batch_tool_results`` methods.  Raw SDK responses remain available in the result,
+while retry counts and the model that answered are represented as typed metadata.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +23,6 @@ from config import (
     ANTHROPIC_API_KEY,
     FALLBACK_CHAIN,
     MAX_RETRY_ATTEMPTS,
-    OLLAMA_BASE_URL,
     OPENAI_API_KEY,
     PER_ROW_TIMEOUT_SECONDS,
     RETRY_BASE_SECONDS,
@@ -318,12 +323,6 @@ def _response_value(response: object, key: str) -> object | None:
 
 
 def _stop_reason(response: object) -> str | None:
-    choices = getattr(response, "choices", None)
-    if isinstance(choices, list) and choices:
-        choice = choices[0]
-        finish_reason = getattr(choice, "finish_reason", None)
-        if finish_reason:
-            return str(finish_reason).lower()
     for key in ("stop_reason", "finish_reason"):
         value = _response_value(response, key)
         if isinstance(value, str):
@@ -348,6 +347,7 @@ def _response_contains_refusal(response: object) -> bool:
 
 
 def _raise_for_response_outcome(response: object, attempts: int) -> None:
+    # The stop reason is intentionally inspected before any response content.
     reason = _stop_reason(response)
     if reason == "refusal":
         raise ProviderRefusalError(
@@ -455,7 +455,12 @@ def retry_with_backoff(
     _sleep: Callable[[float], None] = time.sleep,
     _random: Callable[[], float] = random.random,
 ) -> RetryResult[_T]:
-    """Run ``fn`` with classified retries and return exact attempt metadata."""
+    """Run ``fn`` with classified retries and return exact attempt metadata.
+
+    Permanent failures are raised immediately as typed errors.  A transient error
+    on the last attempt raises :class:`RetryExhaustedError`; it never becomes a
+    refusal or a conservative routing verdict.
+    """
 
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
@@ -554,6 +559,11 @@ def _anthropic_tools(tools: Sequence[Mapping[str, object]]) -> list[dict[str, ob
         description = source.get("description")
         if isinstance(description, str):
             item["description"] = description
+        # Carried through rather than rebuilt away: this converter reconstructs each tool
+        # field by field, so anything not named here is silently dropped. A dropped
+        # cache_control is the worst shape of that bug — the request still succeeds, the
+        # caller still believes it asked for caching, and the only visible symptom is a
+        # cache_read counter that stays at zero.
         cache_control = source.get("cache_control")
         if isinstance(cache_control, Mapping):
             item["cache_control"] = dict(cache_control)
@@ -564,7 +574,7 @@ def _anthropic_tools(tools: Sequence[Mapping[str, object]]) -> list[dict[str, ob
 def _openai_tools(tools: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
     converted: list[dict[str, object]] = []
     for tool in tools:
-        if tool.get("type") == "function" and isinstance(tool.get("function"), Mapping):
+        if tool.get("type") == "function" and isinstance(tool.get("name"), str):
             converted.append(dict(tool))
             continue
         source: Mapping[str, object] = tool
@@ -580,12 +590,13 @@ def _openai_tools(tools: Sequence[Mapping[str, object]]) -> list[dict[str, objec
             )
         item: dict[str, object] = {
             "type": "function",
-            "function": {
-                "name": name,
-                "description": source.get("description", ""),
-                "parameters": dict(schema),
-            },
+            "name": name,
+            "parameters": dict(schema),
+            "strict": bool(source.get("strict", True)),
         }
+        description = source.get("description")
+        if isinstance(description, str):
+            item["description"] = description
         converted.append(item)
     return converted
 
@@ -621,6 +632,13 @@ def _anthropic_block(block: object) -> object:
 
 
 def _system_blocks(content: object) -> list[dict[str, object]]:
+    """Normalise system content to text blocks, preserving any cache breakpoint.
+
+    ``cache_control`` survives this conversion for the same reason it survives
+    ``_anthropic_tools``: the block is rebuilt field by field, so a breakpoint the caller
+    set would otherwise vanish here and the request would run uncached while looking
+    exactly like one that had asked for caching.
+    """
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
     if isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
@@ -672,20 +690,20 @@ def _openai_block(block: object, role: object) -> object:
     if not isinstance(plain, Mapping):
         return plain
     block_type = plain.get("type")
-    if block_type in {"text", "input_text", "output_text"}:
-        return {"type": "text", "text": plain.get("text", "")}
-    if block_type in {"image", "input_image"}:
-        image_url = plain.get("image_url")
-        if not image_url:
-            source = plain.get("source")
-            if isinstance(source, Mapping):
-                if source.get("type") == "base64":
-                    image_url = f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
-                else:
-                    image_url = source.get("url")
-        if not isinstance(image_url, str):
-            raise SchemaValidationError("image is missing image_url/source", category="schema")
-        return {"type": "image_url", "image_url": {"url": image_url}}
+    if block_type == "text":
+        target_type = "output_text" if role == "assistant" else "input_text"
+        return {"type": target_type, "text": plain.get("text", "")}
+    if block_type == "image":
+        source = plain.get("source")
+        if not isinstance(source, Mapping):
+            raise SchemaValidationError("image is missing source", category="schema")
+        if source.get("type") == "base64":
+            url = f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
+        else:
+            url = source.get("url")
+        if not isinstance(url, str):
+            raise SchemaValidationError("image source is missing data/url", category="schema")
+        return {"type": "input_image", "image_url": url}
     return dict(plain)
 
 
@@ -835,6 +853,8 @@ class AnthropicProvider:
                     category="model",
                 )
 
+            # Anthropic requires the paused assistant turn itself, not a synthetic
+            # user message such as "Continue".
             content = _response_value(result.value, "content")
             if not isinstance(content, Sequence) or isinstance(content, (str, bytes, bytearray)):
                 raise ModelFailureError(
@@ -850,7 +870,7 @@ class AnthropicProvider:
 
 
 class OpenAIProvider:
-    """OpenAI / Ollama Chat API adapter with tool support."""
+    """OpenAI Responses API adapter with one item per tool result."""
 
     def __init__(
         self,
@@ -863,11 +883,16 @@ class OpenAIProvider:
         random_source: Callable[[], float] = random.random,
     ) -> None:
         if client is None:
+            if not OPENAI_API_KEY:
+                raise AuthenticationProviderError(
+                    "OPENAI_API_KEY is not configured",
+                    attempts=0,
+                    category="authentication",
+                )
             from openai import OpenAI
 
             client = OpenAI(
-                base_url=OLLAMA_BASE_URL,
-                api_key=OPENAI_API_KEY or "ollama",
+                api_key=OPENAI_API_KEY,
                 max_retries=0,
                 timeout=PER_ROW_TIMEOUT_SECONDS,
             )
@@ -882,11 +907,26 @@ class OpenAIProvider:
         return True
 
     def supports_audio(self) -> bool:
-        return False
+        return True
 
     def transcribe(self, audio_path: str | Path, model: str) -> CompletionResult:
-        """Bypass for audio transcription in local setups."""
-        return CompletionResult(response="[audio_bypassed]", attempts=1, retry_count=0)
+        """Transcribe a local audio file with the provider retry policy."""
+
+        path = Path(audio_path)
+
+        def request() -> object:
+            with path.open("rb") as audio:
+                return self._client.audio.transcriptions.create(model=model, file=audio)
+
+        result = retry_with_backoff(
+            request,
+            self._max_attempts,
+            self._retry_base,
+            self._retry_cap,
+            _sleep=self._sleep,
+            _random=self._random,
+        )
+        return CompletionResult(result.value, result.attempts, result.retry_count)
 
     def batch_tool_results(
         self, results: Sequence[Mapping[str, object] | object]
@@ -896,16 +936,19 @@ class OpenAIProvider:
             identifier, content, _ = _tool_result_parts(result)
             items.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": identifier,
-                    "content": _json_text(content),
+                    "type": "function_call_output",
+                    "call_id": identifier,
+                    "output": _json_text(content),
                 }
             )
         return items
 
     def _request(self, params: dict[str, object], stream: bool) -> object:
-        chat_api = getattr(self._client, "chat").completions
-        return chat_api.create(**params)
+        responses_api = getattr(self._client, "responses")
+        if not stream:
+            return responses_api.create(**params)
+        with responses_api.stream(**params) as response_stream:
+            return response_stream.get_final_response()
 
     def complete(
         self,
@@ -916,16 +959,17 @@ class OpenAIProvider:
     ) -> CompletionResult:
         options = dict(kw)
         max_tokens = _token_limit(options, openai=True)
+        stream = bool(options.pop("stream", False)) or max_tokens > _STREAM_TOKEN_THRESHOLD
         params: dict[str, object] = {
             "model": model,
-            "max_tokens": max_tokens,
-            "messages": _openai_input(messages),
+            "max_output_tokens": max_tokens,
+            "input": _openai_input(messages),
             **options,
         }
         if tools:
             params["tools"] = _openai_tools(tools)
         result = retry_with_backoff(
-            lambda: self._request(params, stream=False),
+            lambda: self._request(params, stream),
             self._max_attempts,
             self._retry_base,
             self._retry_cap,
@@ -960,7 +1004,12 @@ def call_with_fallback(
     provider_resolver: ProviderResolver | None = None,
     **kw: object,
 ) -> FallbackResult:
-    """Try models in the chain with classified error propagation."""
+    """Try at most three distinct models for this row.
+
+    Only :class:`ModelFailureError` advances the chain. Authentication, billing,
+    rate-limit exhaustion, oversized requests, and transport exhaustion propagate
+    immediately, so fallback never hides an account or request-level problem.
+    """
 
     models = tuple(dict.fromkeys(chain))[:3]
     if not models:

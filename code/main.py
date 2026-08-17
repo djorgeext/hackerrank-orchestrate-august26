@@ -6,9 +6,24 @@
     python code/main.py --resume        # skip rows already checkpointed
     python code/main.py --no-dnd        # ablate the gate's quiet-hours modifier
 
-Adapted for local gemma4:26b via Ollama and bypassing audio/voice messages.
+Rows are iterated in **file order** and addressed by ``message_id`` throughout. Nothing
+here indexes a parsed row number: the CSV is the ordering authority, and a row number is
+a property of one particular parse of one particular file.
+
+Output order is a separate question with a separate answer. ``dataset/output.csv`` ships
+pre-keyed in a shuffled order that the submission must preserve (§9.12), so the writer is
+opened against that order and buffers completed rows until their turn arrives — which is
+also what makes concurrency safe to add and safe to remove.
+
+A partial run never overwrites the deliverable. ``--limit`` writes to
+``output.subset.csv`` beside it, because a full-order file containing 5 of 110 rows is a
+broken submission that looks like a finished one. Labelled samples are loaded and
+routed exclusively by ``evaluation/main.py`` so gold labels are unreachable here.
 """
 
+# code/ is deliberately not a Python package: "code" is a stdlib module name, so making
+# it one would shadow Python's own. Imports are therefore rooted at code/, and this line
+# puts code/ on the path regardless of the working directory the script was launched from.
 import pathlib
 import sys
 
@@ -64,7 +79,12 @@ class Selection:
 
 
 def select(dataset: Dataset, args: argparse.Namespace) -> Selection:
-    """Choose which rows to route, in the order messages.csv lists them."""
+    """Choose which rows to route, in the order messages.csv lists them.
+
+    A partial run never writes over the deliverable: ``dataset/output.csv`` is keyed to
+    all 110 rows in a fixed order, and a file containing five of them in that order is a
+    broken submission that looks like a finished one.
+    """
     messages = list(dataset.messages)
     if args.limit is not None:
         messages = messages[: args.limit]
@@ -115,12 +135,15 @@ class RowPlan:
 
 
 def _media_payload(dossier: Dossier) -> MediaPayload:
-    """Bypass voice note transcription; images remain available for the vision model."""
+    """Transcribe a voice note deterministically; images are the model's to open."""
     attachment = dossier.media
-    if attachment.media_type in {"voice", "audio"} or attachment.media_id is None:
-        # Omite la llamada a APIs de transcripción de audio
+    if attachment.media_type != "voice" or attachment.media_id is None:
         return NO_MEDIA
-    return NO_MEDIA
+    reference = media_module.describe(
+        attachment.media_id, "voice", attachment.file_path
+    )
+    transcript = media_module.transcribe(reference)
+    return MediaPayload(transcript=transcript.text, transcript_status=transcript.status)
 
 
 def _fingerprint(
@@ -128,7 +151,13 @@ def _fingerprint(
     tools: Sequence[dict[str, object]],
     model: str,
 ) -> str:
-    """Key a completed row by its inputs, its prompt version and its model (§9.10.4)."""
+    """Key a completed row by its inputs, its prompt version and its model (§9.10.4).
+
+    The rendered prompt *is* the input digest — it already contains every dossier fact,
+    every evidence candidate and the message text — so editing a feature, a retrieval
+    weight or a single word of a prompt busts every cached row without anyone having to
+    remember to bump a version.
+    """
     payload = json.dumps(
         {
             "messages": messages,
@@ -148,6 +177,9 @@ def plan_row(
 ) -> RowPlan:
     dossier = build_dossier(dataset, index, message)
     media = _media_payload(dossier)
+    # Rendered here for the fingerprint and again inside the loop for the request. The
+    # renderer is pure and its inputs are identical, so the two are the same bytes —
+    # which is what makes the fingerprint a description of what was actually sent.
     prompt = build_messages(dossier, dossier.evidence_candidates, media)
     tools = build_tools(dossier)
     return RowPlan(
@@ -166,7 +198,14 @@ def plan_row(
 
 
 class RampingGate:
-    """Admission control that opens from ``start`` to ``cap`` as rows come back clean."""
+    """Admission control that opens from ``start`` to ``cap`` as rows come back clean.
+
+    A run that opens at full width sends a burst of identical-shaped requests into a
+    rate limiter that has never seen this workload. Starting narrow and widening one slot
+    per successful row costs a few seconds at the head of the run and keeps the 429 storm
+    from happening at all. A failing row does not widen the gate — a run that is going
+    badly should not accelerate into it.
+    """
 
     def __init__(self, start: int, cap: int) -> None:
         self._cap = max(1, cap)
@@ -223,6 +262,7 @@ class RunReport:
     actions: Counter[str] = field(default_factory=Counter)
     outcomes: Counter[str] = field(default_factory=Counter)
     gate_rules: Counter[str] = field(default_factory=Counter)
+    # model -> [input, output, cache_read, cache_write]
     tokens: dict[str, list[int]] = field(default_factory=dict)
     latencies: list[float] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -252,9 +292,9 @@ class RunReport:
                 self.gate_rules[rule] += 1
             bucket = self.tokens.setdefault(metrics.model or "unknown", [0, 0, 0, 0])
             bucket[0] += metrics.input_tokens
-            bucket += metrics.output_tokens
-            bucket += metrics.cache_read_tokens
-            bucket += metrics.cache_write_tokens
+            bucket[1] += metrics.output_tokens
+            bucket[2] += metrics.cache_read_tokens
+            bucket[3] += metrics.cache_write_tokens
 
     def note_resumed(self) -> None:
         with self.lock:
@@ -265,6 +305,13 @@ class RunReport:
             self.crashes += 1
 
     def cost(self) -> tuple[float, list[str]]:
+        """Price what can be priced and name what cannot, rather than guessing a rate.
+
+        Cached tokens are priced at their own rates rather than folded into the input
+        count. On a cached request the provider reports ``input_tokens`` as the *uncached
+        remainder*, so pricing that field alone would quietly under-report a well-cached
+        run and make the cache look free instead of cheap.
+        """
         total = 0.0
         unpriced: list[str] = []
         for model, (inputs, outputs, cache_read, cache_write) in sorted(self.tokens.items()):
@@ -278,7 +325,7 @@ class RunReport:
                 + cache_read * CACHE_READ_MULTIPLIER
                 + cache_write * CACHE_WRITE_MULTIPLIER
             )
-            total += (billable_input * rates[0] + outputs * rates) / 1_000_000
+            total += (billable_input * rates[0] + outputs * rates[1]) / 1_000_000
         return total, unpriced
 
     def p95_latency(self) -> float:
@@ -292,9 +339,11 @@ class RunReport:
 def print_report(report: RunReport, elapsed: float, destination: object) -> None:
     cost, unpriced = report.cost()
     inputs = sum(bucket[0] for bucket in report.tokens.values())
-    outputs = sum(bucket for bucket in report.tokens.values())
-    cache_read = sum(bucket for bucket in report.tokens.values())
-    cache_write = sum(bucket for bucket in report.tokens.values())
+    outputs = sum(bucket[1] for bucket in report.tokens.values())
+    cache_read = sum(bucket[2] for bucket in report.tokens.values())
+    cache_write = sum(bucket[3] for bucket in report.tokens.values())
+    # The denominator is every prompt token the run sent, cached or not — the share is
+    # meaningless against the uncached remainder alone.
     prompt_tokens = inputs + cache_read + cache_write
     hit_rate = cache_read / prompt_tokens if prompt_tokens else 0.0
     mean_tools = report.tool_calls / report.rows if report.rows else 0.0
@@ -316,6 +365,14 @@ def print_report(report: RunReport, elapsed: float, destination: object) -> None
         f"cache_write         {cache_write:,}",
         f"total cost          ${cost:.4f}",
     ]
+    if prompt_tokens and cache_read == 0:
+        # A zero here means the breakpoint is set and nothing ever read it. Said out loud
+        # rather than left as a zero to be read past, because the failure is silent: the
+        # request succeeds, the write premium is paid, and no hit is ever taken.
+        lines.append(
+            "  NOTE              cache_read is 0 — every request wrote a fresh prefix and "
+            "none re-read one"
+        )
     if unpriced:
         lines.append(f"  unpriced models   {', '.join(unpriced)}")
     lines.append(
@@ -328,7 +385,7 @@ def print_report(report: RunReport, elapsed: float, destination: object) -> None
     )
     if report.gate_rules:
         lines.append("gate rules fired")
-        for rule, count in sorted(report.gate_rules.items(), key=lambda item: (-item, item[0])):
+        for rule, count in sorted(report.gate_rules.items(), key=lambda item: (-item[1], item[0])):
             lines.append(f"  {rule:<28} {count}")
     else:
         lines.append("gate rules fired    none")
@@ -362,6 +419,8 @@ def write_trace(
         "outcome": raw.outcome,
         "failure_reason": raw.failure_reason,
         "last_model_text": raw.last_text,
+        # The sentence a reason_repaired row shipped without. Present so a repair can be
+        # checked against what it replaced without re-running the row.
         "rejected_reason": raw.rejected_reason,
         "evidence_candidates": [
             candidate.history_message_id
@@ -407,24 +466,6 @@ def _jsonable(value: object) -> object:
 def route_row(plan: RowPlan, args: argparse.Namespace, report: RunReport) -> dict[str, str]:
     """Decide one row and return its CSV row. Never raises."""
     try:
-        # Bypass directo para mensajes de audio / notas de voz
-        if plan.dossier.media.media_type in {"voice", "audio"}:
-            LOGGER.info("bypassing_audio_message message_id=%s", plan.message.message_id)
-            final = FinalDecision(
-                message_id=plan.message.message_id,
-                action="mute",
-                message_type="other",
-                reason="Audio message bypassed as local model only processes text and images.",
-                confidence=0.55,
-                evidence_message_ids="",
-            )
-            with report.lock:
-                report.rows += 1
-                report.actions[final.action] += 1
-                report.outcomes["audio_bypassed"] += 1
-            return final.csv_row()
-
-        # Enrutamiento normal de texto e imágenes con gemma4:26b
         client = agent_loop.RowClient(agent_loop.fallback_chain_for(args.model))
         raw = agent_loop.run(plan.dossier, plan.dossier.evidence_candidates, plan.media, client)
         final, fired = apply_gate(raw.decision, plan.dossier, dnd_modifier=not args.no_dnd)
@@ -507,6 +548,10 @@ def _report_dry_run(plans: Sequence[RowPlan], destination: object) -> int:
         len(str(message.get("content", ""))) for plan in plans for message in plan.messages
     )
     no_candidates = sum(1 for plan in plans if not plan.dossier.evidence_candidates)
+    # Tools render ahead of the system prompt in the cache prefix, so rows can only share
+    # a cached span when their tool schemas are byte-identical. This counts how many
+    # distinct prefixes the run will actually produce: one means the cache is shared
+    # across every row, len(plans) means it is shared across none of them.
     distinct_tools = len(
         {
             json.dumps(plan.tools, ensure_ascii=False, sort_keys=True, default=str)
@@ -545,6 +590,8 @@ def run_selection(
     if selection.is_full_run:
         assert_full_coverage(dataset)
 
+    # The fingerprint is keyed on the model that will actually answer, so a run under a
+    # different --model cannot resume rows produced by the previous one.
     plans = [plan_row(dataset, index, message, args.model) for message in selection.messages]
     if args.dry_run:
         return _report_dry_run(plans, selection.destination)
@@ -557,7 +604,7 @@ def run_selection(
     def handle(plan: RowPlan) -> None:
         cached = completed.get(plan.message.message_id)
         if cached is not None and cached[0] == plan.fingerprint:
-            writer.append_row(cached)
+            writer.append_row(cached[1])
             report.note_resumed()
             return
         with gate.slot() as slot:
@@ -570,6 +617,8 @@ def run_selection(
 
     with writer.open_writer(selection.destination, selection.order):
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            # Consumed eagerly so a worker exception surfaces here rather than being
+            # swallowed when the pool shuts down.
             for _ in pool.map(handle, plans):
                 pass
 
